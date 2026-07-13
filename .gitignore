@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.venv/
+.server-venv/
+venv/
+build/
+dist/
+target/
+*.spec
+*.log
+client/bin/frpc.exe
+server/bin/frps
+frpc.toml
+frps.toml
+config.json
+*.db
+*.db-wal
+*.db-shm
+config.json.legacy-backup-*
+
+# Tauri build-time generated schemas
+crates/frp-game-client/gen/
