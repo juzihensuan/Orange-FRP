@@ -13,3 +13,5 @@ pub use model::{
 
 pub const API_PORT: u16 = 7631;
 pub const FRPS_PORT: u16 = 7000;
+pub const DEFAULT_TUNNEL_LIMIT: u32 = 256;
+pub const MAX_TUNNEL_LIMIT: u32 = 256;

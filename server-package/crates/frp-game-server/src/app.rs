@@ -9,7 +9,7 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use frp_game_common::{
     decrypt_payload, encrypt_payload, normalize_tunnels, parse_frp_version_text, proxy_name_for,
-    Envelope, PortTrafficUsage, TrafficSummary, Tunnel, API_PORT, FRPS_PORT,
+    Envelope, PortTrafficUsage, TrafficSummary, Tunnel, API_PORT, FRPS_PORT, MAX_TUNNEL_LIMIT,
 };
 use rand::seq::SliceRandom;
 use rand::{distributions::Alphanumeric, rngs::OsRng, Rng, RngCore};
@@ -53,6 +53,7 @@ const MAX_RATE_LIMIT_CLIENTS: usize = 8_192;
 const REPLAY_TTL: Duration = Duration::from_secs(300);
 const RATE_LIMIT_IDLE_TTL: Duration = Duration::from_secs(300);
 const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_NEW_USER_TUNNEL_LIMIT: u32 = 5;
 
 #[derive(Debug, Parser)]
 #[command(name = "frp-game-server", about = "Orange FRP Linux 服务端管理工具")]
@@ -98,6 +99,8 @@ enum Commands {
         traffic_limit_gb: Option<f64>,
         #[arg(long)]
         speed_limit_mbps: Option<u32>,
+        #[arg(long)]
+        tunnel_limit: Option<u32>,
     },
     ViewUsers,
     DeleteUser,
@@ -122,6 +125,12 @@ enum Commands {
         account: Option<String>,
         #[arg(long)]
         mbps: Option<u32>,
+    },
+    SetTunnelLimit {
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
     },
     Serve {
         #[arg(long)]
@@ -542,7 +551,7 @@ fn command_init(
     storage.create(&mut config)?;
     write_frps_config(&config)?;
     println!("\n初始化完成。现在开始添加第一个用户。");
-    command_add_user(None, None, None, None)
+    command_add_user(None, None, None, None, None)
 }
 
 fn command_setup(
@@ -640,6 +649,24 @@ fn validate_password(password: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_tunnel_limit(limit: u32) -> Result<()> {
+    if limit > MAX_TUNNEL_LIMIT {
+        bail!("隧道数量限制必须在 0-{MAX_TUNNEL_LIMIT} 之间。");
+    }
+    Ok(())
+}
+
+fn prompt_tunnel_limit(label: &str, default: u32) -> Result<u32> {
+    loop {
+        let limit = prompt_u32(label, default)?;
+        if let Err(error) = validate_tunnel_limit(limit) {
+            println!("{error}");
+        } else {
+            return Ok(limit);
+        }
+    }
+}
+
 fn print_user_details(config: &ServerConfig, user: &ServerUser) -> Result<()> {
     println!();
     println!("{}", color("用户连接信息", "36;1"));
@@ -652,7 +679,10 @@ fn print_user_details(config: &ServerConfig, user: &ServerUser) -> Result<()> {
         None => println!("密码: 旧数据库未保存可回显密码，请先修改该用户密码"),
     }
     println!("36位混合密钥: {}", user.secret);
-    println!("隧道数量: {}", user.tunnels.len());
+    let tunnel_count = user.tunnels.len();
+    let tunnel_limit = user.tunnel_limit as usize;
+    println!("隧道数量: {tunnel_count} / {tunnel_limit}");
+    println!("还可创建: {} 条", tunnel_limit.saturating_sub(tunnel_count));
     println!(
         "流量限制: {}",
         if user.traffic_limit_bytes == 0 {
@@ -715,6 +745,7 @@ fn command_add_user(
     password: Option<String>,
     traffic_limit_gb: Option<f64>,
     speed_limit_mbps: Option<u32>,
+    tunnel_limit: Option<u32>,
 ) -> Result<()> {
     require_root("添加用户")?;
     let storage = storage();
@@ -752,6 +783,16 @@ fn command_add_user(
         Some(value) => value,
         None => prompt_u32("请输入速度限制 Mbps（0 表示不限，默认 0）: ", 0)?,
     };
+    let tunnel_limit = match tunnel_limit {
+        Some(value) => {
+            validate_tunnel_limit(value)?;
+            value
+        }
+        None => prompt_tunnel_limit(
+            "请输入隧道数量限制（0 表示禁止创建，最大 256，默认 5）: ",
+            DEFAULT_NEW_USER_TUNNEL_LIMIT,
+        )?,
+    };
     let now = now_unix();
     let secret = random_secret(36);
     let user = ServerUser {
@@ -761,6 +802,7 @@ fn command_add_user(
         password_encrypted: encrypt_user_password(&config.api_salt, &secret, &password)?,
         secret,
         tunnels: Vec::new(),
+        tunnel_limit,
         traffic_limit_bytes: gb_to_bytes(traffic_limit_gb)?,
         traffic_used_bytes: 0,
         speed_limit_mbps,
@@ -967,6 +1009,38 @@ fn command_set_speed_limit(account: Option<String>, mbps: Option<u32>) -> Result
     Ok(())
 }
 
+fn command_set_tunnel_limit(account: Option<String>, limit: Option<u32>) -> Result<()> {
+    require_root("修改用户隧道数量限制")?;
+    let storage = storage();
+    let mut config = storage.read()?;
+    let Some(index) = resolve_user_index(
+        &config,
+        account.as_deref(),
+        "请输入要修改隧道数量限制的账号或序号: ",
+    )?
+    else {
+        return Ok(());
+    };
+    let limit = match limit {
+        Some(value) => {
+            validate_tunnel_limit(value)?;
+            value
+        }
+        None => prompt_tunnel_limit(
+            "请输入新的隧道数量限制（0 表示禁止创建，最大 256）: ",
+            config.users[index].tunnel_limit,
+        )?,
+    };
+    config.users[index].tunnel_limit = limit;
+    config.users[index].updated_at = now_unix();
+    config.updated_at = now_unix();
+    storage.save(&mut config)?;
+    restart_service_if_running()?;
+    println!("用户隧道数量限制已修改并应用。");
+    print_user_details(&config, &config.users[index])?;
+    Ok(())
+}
+
 fn command_delete_user() -> Result<()> {
     require_root("删除用户")?;
     let storage = storage();
@@ -1094,19 +1168,21 @@ fn command_menu() -> Result<()> {
         println!("5. 修改用户流量限制");
         println!("6. 修改用户已用流量");
         println!("7. 修改用户速度限制");
-        println!("8. 卸载服务端");
+        println!("8. 修改用户隧道数量限制");
+        println!("9. 卸载服务端");
         println!("0. 退出菜单");
         println!();
         let choice = prompt_non_empty("请选择操作: ")?;
         let result = match choice.as_str() {
-            "1" => command_add_user(None, None, None, None),
+            "1" => command_add_user(None, None, None, None, None),
             "2" => command_view_users(),
             "3" => command_delete_user(),
             "4" => command_view_traffic(None),
             "5" => command_set_traffic_limit(None, None),
             "6" => command_set_traffic_used(None, None),
             "7" => command_set_speed_limit(None, None),
-            "8" => {
+            "8" => command_set_tunnel_limit(None, None),
+            "9" => {
                 let confirm =
                     prompt_non_empty("将停止服务并完全卸载 Orange FRP 服务端，输入 YES 确认: ")?;
                 if confirm == "YES" {
@@ -1218,8 +1294,13 @@ fn normalize_user_tunnels(
     user_index: usize,
     tunnels: &[Tunnel],
 ) -> Result<Vec<Tunnel>> {
+    let tunnel_limit = config.users[user_index].tunnel_limit as usize;
+    let current_tunnel_count = config.users[user_index].tunnels.len();
+    if tunnels.len() > tunnel_limit && tunnels.len() > current_tunnel_count {
+        bail!("超出隧道数量限制：最多可创建 {tunnel_limit} 条隧道。");
+    }
     if tunnels.len() > MAX_TUNNELS_PER_USER {
-        bail!("每个用户最多创建 {MAX_TUNNELS_PER_USER} 条隧道。");
+        bail!("隧道数量超过系统最大值 {MAX_TUNNELS_PER_USER}。");
     }
     let mut normalized = normalize_tunnels(tunnels)?;
     let current = &config.users[user_index];
@@ -1452,6 +1533,7 @@ async fn login(
             "frps_port": frps_bind_port,
             "frps_token": frps_token,
             "tunnels": user.tunnels,
+            "tunnel_limit": user.tunnel_limit,
             "frps_version": state.frps_version,
             "traffic": traffic,
             "server_time": now_unix(),
@@ -1488,7 +1570,12 @@ async fn tunnels(
                 &config.api_salt,
                 user,
                 StatusCode::OK,
-                json!({"ok": true, "tunnels": user.tunnels, "traffic": traffic_summary(user)}),
+                json!({
+                    "ok": true,
+                    "tunnels": user.tunnels,
+                    "tunnel_limit": user.tunnel_limit,
+                    "traffic": traffic_summary(user)
+                }),
             )
         }
         Some("save") => {
@@ -1576,7 +1663,12 @@ async fn tunnels(
                 &config.api_salt,
                 user,
                 StatusCode::OK,
-                json!({"ok": true, "tunnels": user.tunnels, "traffic": traffic_summary(user)}),
+                json!({
+                    "ok": true,
+                    "tunnels": user.tunnels,
+                    "tunnel_limit": user.tunnel_limit,
+                    "traffic": traffic_summary(user)
+                }),
             )
         }
         _ => encrypted_response(
@@ -1614,7 +1706,11 @@ async fn usage(
         &config.api_salt,
         user,
         StatusCode::OK,
-        json!({"ok": true, "traffic": traffic_summary(user)}),
+        json!({
+            "ok": true,
+            "tunnel_limit": user.tunnel_limit,
+            "traffic": traffic_summary(user)
+        }),
     )
 }
 
@@ -2148,13 +2244,21 @@ pub async fn run() -> Result<()> {
             password,
             traffic_limit_gb,
             speed_limit_mbps,
-        } => command_add_user(account, password, traffic_limit_gb, speed_limit_mbps),
+            tunnel_limit,
+        } => command_add_user(
+            account,
+            password,
+            traffic_limit_gb,
+            speed_limit_mbps,
+            tunnel_limit,
+        ),
         Commands::ViewUsers => command_view_users(),
         Commands::DeleteUser => command_delete_user(),
         Commands::ViewTraffic { account } => command_view_traffic(account),
         Commands::SetTrafficLimit { account, gb } => command_set_traffic_limit(account, gb),
         Commands::SetTrafficUsed { account, gb } => command_set_traffic_used(account, gb),
         Commands::SetSpeedLimit { account, mbps } => command_set_speed_limit(account, mbps),
+        Commands::SetTunnelLimit { account, limit } => command_set_tunnel_limit(account, limit),
         Commands::Serve { api_only } => command_serve(api_only).await,
         Commands::InstallService => command_install_service(),
         Commands::InstallFrps { force } => {
@@ -2184,6 +2288,7 @@ mod tests {
                 backend_port: 20_000,
                 ..Tunnel::default()
             }],
+            tunnel_limit: 5,
             traffic_limit_bytes: 1024,
             traffic_used_bytes: 0,
             speed_limit_mbps: 20,
@@ -2331,5 +2436,37 @@ mod tests {
             config.users.iter().position(|user| user.account == "1"),
             Some(0)
         );
+    }
+
+    #[test]
+    fn rejects_tunnels_above_user_limit() {
+        let mut config = test_config();
+        config.users[0].tunnel_limit = 1;
+        let mut tunnels = config.users[0].tunnels.clone();
+        tunnels.push(tunnels[0].clone());
+
+        let error = normalize_user_tunnels(&config, 0, &tunnels).unwrap_err();
+        assert_eq!(error.to_string(), "超出隧道数量限制：最多可创建 1 条隧道。");
+    }
+
+    #[test]
+    fn allows_reducing_existing_tunnels_toward_a_lower_limit() {
+        let mut config = test_config();
+        let mut second = config.users[0].tunnels[0].clone();
+        second.id = "second".into();
+        second.proxy_name = "orange_second".into();
+        second.protocol = "TCP".into();
+        second.name = "Second".into();
+        second.remark = "test".into();
+        second.local_ip = "127.0.0.1".into();
+        second.local_port = 25_566;
+        second.remote_port = 25_566;
+        second.backend_port = 20_001;
+        config.users[0].tunnels.push(second.clone());
+        config.users[0].tunnel_limit = 0;
+
+        let remaining = vec![second];
+        let normalized = normalize_user_tunnels(&config, 0, &remaining).unwrap();
+        assert_eq!(normalized.len(), 1);
     }
 }

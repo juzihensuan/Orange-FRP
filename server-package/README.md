@@ -38,7 +38,7 @@ sudo bash install.sh --install
 orange
 ```
 
-菜单支持用户增删查、端口与上下行流量查看、总流量和剩余流量查看、流量限制、已用流量和 Mbps 限速修改，以及完整卸载。
+菜单支持用户增删查、端口与上下行流量查看、总流量和剩余流量查看、流量限制、已用流量、Mbps 限速和隧道数量限制修改，以及完整卸载。
 
 服务端使用 `/etc/frp-game/orange-frp.db` 保存 SQLite 数据。旧版 `config.json` 会自动迁移并保留带时间戳的备份，明文密码会转换为 Argon2id 摘要。
 
@@ -51,7 +51,14 @@ sudo frp-game-server add-user \
   --account test01 \
   --password 'StrongPassword' \
   --traffic-limit-gb 10 \
-  --speed-limit-mbps 20
+  --speed-limit-mbps 20 \
+  --tunnel-limit 5
+```
+
+新建用户默认可创建 5 条隧道，`--tunnel-limit 0` 表示禁止创建，最大值为 256。修改已有用户：
+
+```bash
+sudo frp-game-server set-tunnel-limit --account test01 --limit 10
 ```
 
 卸载：

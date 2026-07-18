@@ -4,7 +4,11 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{API_PORT, FRPS_PORT};
+use crate::{API_PORT, DEFAULT_TUNNEL_LIMIT, FRPS_PORT};
+
+fn default_tunnel_limit() -> u32 {
+    DEFAULT_TUNNEL_LIMIT
+}
 
 #[derive(Debug, Error)]
 pub enum FrpGameError {
@@ -98,6 +102,8 @@ pub struct ServerProfile {
     pub frps_online: bool,
     #[serde(default)]
     pub traffic: TrafficSummary,
+    #[serde(default = "default_tunnel_limit")]
+    pub tunnel_limit: u32,
     pub tunnels: Vec<Tunnel>,
 }
 
@@ -124,6 +130,8 @@ pub struct LoginResponse {
     pub frps_version: String,
     #[serde(default)]
     pub traffic: TrafficSummary,
+    #[serde(default = "default_tunnel_limit")]
+    pub tunnel_limit: u32,
     pub tunnels: Vec<Tunnel>,
     pub server_time: i64,
 }
@@ -161,29 +169,27 @@ pub fn is_valid_port(value: u16) -> bool {
 }
 
 pub fn parse_frp_version_text(text: &str) -> Option<String> {
-    text.split_whitespace()
-        .filter_map(|part| {
-            let token = part
-                .trim_matches(|ch: char| {
-                    !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_')
-                })
-                .trim_start_matches(['v', 'V']);
-            let mut parts = token.split('.');
-            let major = parts.next()?;
-            let minor = parts.next()?;
-            let patch = parts.next()?;
-            let patch_core = patch.split(['-', '_']).next().unwrap_or_default();
-            if major.chars().all(|ch| ch.is_ascii_digit())
-                && minor.chars().all(|ch| ch.is_ascii_digit())
-                && !patch_core.is_empty()
-                && patch_core.chars().all(|ch| ch.is_ascii_digit())
-            {
-                Some(token.to_string())
-            } else {
-                None
-            }
-        })
-        .next()
+    text.split_whitespace().find_map(|part| {
+        let token = part
+            .trim_matches(|ch: char| {
+                !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_')
+            })
+            .trim_start_matches(['v', 'V']);
+        let mut parts = token.split('.');
+        let major = parts.next()?;
+        let minor = parts.next()?;
+        let patch = parts.next()?;
+        let patch_core = patch.split(['-', '_']).next().unwrap_or_default();
+        if major.chars().all(|ch| ch.is_ascii_digit())
+            && minor.chars().all(|ch| ch.is_ascii_digit())
+            && !patch_core.is_empty()
+            && patch_core.chars().all(|ch| ch.is_ascii_digit())
+        {
+            Some(token.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 pub fn normalize_server(value: &str) -> Result<(String, String, u16, String), FrpGameError> {
@@ -285,6 +291,7 @@ impl ServerProfile {
             id: new_server_id(),
             api_port: API_PORT,
             frps_port: FRPS_PORT,
+            tunnel_limit: DEFAULT_TUNNEL_LIMIT,
             ..Self::default()
         }
     }
@@ -311,5 +318,13 @@ mod tests {
         assert_eq!(host, "::1");
         assert_eq!(port, 8000);
         assert_eq!(base, "http://[::1]:8000");
+    }
+
+    #[test]
+    fn defaults_missing_tunnel_limit_for_old_profiles() {
+        let mut value = serde_json::to_value(ServerProfile::new_empty()).unwrap();
+        value.as_object_mut().unwrap().remove("tunnel_limit");
+        let profile: ServerProfile = serde_json::from_value(value).unwrap();
+        assert_eq!(profile.tunnel_limit, DEFAULT_TUNNEL_LIMIT);
     }
 }

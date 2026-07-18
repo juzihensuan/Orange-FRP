@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/juzihensuan/Orange-FRP/main/install
 orange
 ```
 
-服务端支持用户管理、隧道端口记录、流量统计、流量配额、Mbps 限速和完整卸载。配置与用户数据保存在 SQLite 数据库 `/etc/frp-game/orange-frp.db`。
+服务端支持用户管理、每用户隧道数量限制、隧道端口记录、流量统计、流量配额、Mbps 限速和完整卸载。配置与用户数据保存在 SQLite 数据库 `/etc/frp-game/orange-frp.db`。
 
 ## 手动安装
 

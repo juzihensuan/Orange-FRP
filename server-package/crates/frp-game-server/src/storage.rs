@@ -4,6 +4,7 @@ use argon2::Argon2;
 use base64::Engine;
 use frp_game_common::{
     decrypt_stored_text, encrypt_stored_text, normalize_tunnels, proxy_name_for, Tunnel,
+    DEFAULT_TUNNEL_LIMIT, MAX_TUNNEL_LIMIT,
 };
 use rand::rngs::OsRng;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -19,8 +20,8 @@ pub const DEFAULT_PLUGIN_PORT: u16 = 7632;
 pub const DEFAULT_PUBLIC_BIND: &str = "0.0.0.0";
 pub const BACKEND_PORT_START: u16 = 20_000;
 pub const BACKEND_PORT_END: u16 = 59_999;
-pub const MAX_TUNNELS_PER_USER: usize = 256;
-const SCHEMA_VERSION: i64 = 2;
+pub const MAX_TUNNELS_PER_USER: usize = MAX_TUNNEL_LIMIT as usize;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -46,6 +47,7 @@ pub struct ServerUser {
     pub password_encrypted: String,
     pub secret: String,
     pub tunnels: Vec<Tunnel>,
+    pub tunnel_limit: u32,
     pub traffic_limit_bytes: u64,
     pub traffic_used_bytes: u64,
     pub speed_limit_mbps: u32,
@@ -159,7 +161,7 @@ impl Storage {
 
         let mut users = connection.prepare(
             "SELECT id, account, password_hash, password_encrypted, secret, \
-                    traffic_limit_bytes, traffic_used_bytes, speed_limit_mbps, \
+                    tunnel_limit, traffic_limit_bytes, traffic_used_bytes, speed_limit_mbps, \
                     created_at, updated_at \
              FROM users ORDER BY account",
         )?;
@@ -171,12 +173,13 @@ impl Storage {
                 password_encrypted: row.get(3)?,
                 secret: row.get(4)?,
                 tunnels: Vec::new(),
-                traffic_limit_bytes: sql_u64(row.get(5)?)?,
-                traffic_used_bytes: sql_u64(row.get(6)?)?,
-                speed_limit_mbps: sql_u32(row.get(7)?)?,
+                tunnel_limit: sql_u32(row.get(5)?)?,
+                traffic_limit_bytes: sql_u64(row.get(6)?)?,
+                traffic_used_bytes: sql_u64(row.get(7)?)?,
+                speed_limit_mbps: sql_u32(row.get(8)?)?,
                 traffic_by_proxy: HashMap::new(),
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         })?;
         config.users = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -407,6 +410,7 @@ fn create_schema(connection: &mut Connection) -> Result<()> {
             password_hash TEXT NOT NULL,
             password_encrypted TEXT NOT NULL,
             secret TEXT NOT NULL UNIQUE,
+            tunnel_limit INTEGER NOT NULL,
             traffic_limit_bytes INTEGER NOT NULL,
             traffic_used_bytes INTEGER NOT NULL,
             speed_limit_mbps INTEGER NOT NULL,
@@ -444,15 +448,25 @@ fn create_schema(connection: &mut Connection) -> Result<()> {
             [],
         )?;
     }
+    if !users_has_column(connection, "tunnel_limit")? {
+        connection.execute(
+            "ALTER TABLE users ADD COLUMN tunnel_limit INTEGER NOT NULL DEFAULT 256",
+            [],
+        )?;
+    }
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
 fn users_has_password_encrypted_column(connection: &Connection) -> Result<bool> {
+    users_has_column(connection, "password_encrypted")
+}
+
+fn users_has_column(connection: &Connection, expected: &str) -> Result<bool> {
     let mut statement = connection.prepare("PRAGMA table_info(users)")?;
     let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
     for column in columns {
-        if column? == "password_encrypted" {
+        if column? == expected {
             return Ok(true);
         }
     }
@@ -619,14 +633,15 @@ fn write_snapshot(transaction: &Transaction<'_>, config: &ServerConfig) -> Resul
         transaction.execute(
             "INSERT INTO users (
                 id, account, password_hash, password_encrypted, secret,
-                traffic_limit_bytes, traffic_used_bytes, speed_limit_mbps,
-                created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                tunnel_limit, traffic_limit_bytes, traffic_used_bytes,
+                speed_limit_mbps, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 account=excluded.account,
                 password_hash=excluded.password_hash,
                 password_encrypted=excluded.password_encrypted,
                 secret=excluded.secret,
+                tunnel_limit=excluded.tunnel_limit,
                 traffic_limit_bytes=excluded.traffic_limit_bytes,
                 traffic_used_bytes=excluded.traffic_used_bytes,
                 speed_limit_mbps=excluded.speed_limit_mbps,
@@ -638,6 +653,7 @@ fn write_snapshot(transaction: &Transaction<'_>, config: &ServerConfig) -> Resul
                 user.password_hash,
                 user.password_encrypted,
                 user.secret,
+                i64::from(user.tunnel_limit),
                 sql_i64(user.traffic_limit_bytes)?,
                 sql_i64(user.traffic_used_bytes)?,
                 i64::from(user.speed_limit_mbps),
@@ -796,6 +812,13 @@ fn normalize_loaded_config(config: &mut ServerConfig) -> Result<()> {
             decrypt_user_password(&api_salt, &user.secret, &user.password_encrypted)
                 .with_context(|| format!("用户 {} 的加密密码无效。", user.account))?;
         }
+        if user.tunnel_limit > MAX_TUNNEL_LIMIT {
+            bail!(
+                "用户 {} 的隧道限制超过最大值 {}。",
+                user.account,
+                MAX_TUNNEL_LIMIT
+            );
+        }
         if user.tunnels.len() > MAX_TUNNELS_PER_USER {
             bail!(
                 "用户 {} 的隧道数量超过上限 {}。",
@@ -863,6 +886,7 @@ fn migrate_legacy_config(path: &Path) -> Result<ServerConfig> {
                 password: single.password,
                 secret: single.secret,
                 tunnels: single.tunnels,
+                tunnel_limit: single.tunnel_limit,
                 traffic_limit_bytes: 0,
                 traffic_used_bytes: 0,
                 speed_limit_mbps: 0,
@@ -923,6 +947,7 @@ fn migrate_legacy_config(path: &Path) -> Result<ServerConfig> {
             password_encrypted,
             secret: legacy_user.secret,
             tunnels,
+            tunnel_limit: legacy_user.tunnel_limit,
             traffic_limit_bytes: legacy_user.traffic_limit_bytes,
             traffic_used_bytes: legacy_user.traffic_used_bytes,
             speed_limit_mbps: legacy_user.speed_limit_mbps,
@@ -1013,6 +1038,8 @@ struct LegacyUser {
     secret: String,
     #[serde(default)]
     tunnels: Vec<Tunnel>,
+    #[serde(default = "default_legacy_tunnel_limit")]
+    tunnel_limit: u32,
     #[serde(default)]
     traffic_limit_bytes: u64,
     #[serde(default)]
@@ -1052,10 +1079,16 @@ struct LegacySingleConfig {
     frps_binary: String,
     #[serde(default)]
     tunnels: Vec<Tunnel>,
+    #[serde(default = "default_legacy_tunnel_limit")]
+    tunnel_limit: u32,
     #[serde(default)]
     created_at: i64,
     #[serde(default)]
     updated_at: i64,
+}
+
+fn default_legacy_tunnel_limit() -> u32 {
+    DEFAULT_TUNNEL_LIMIT
 }
 
 #[cfg(test)]
@@ -1107,6 +1140,7 @@ mod tests {
                     remote_port: 18_080,
                     backend_port: 20_000,
                 }],
+                tunnel_limit: 8,
                 traffic_limit_bytes: 1024,
                 traffic_used_bytes: 12,
                 speed_limit_mbps: 20,
@@ -1120,6 +1154,7 @@ mod tests {
         storage.save_new(&mut config).unwrap();
         let loaded = storage.read().unwrap();
         assert_eq!(loaded.users.len(), 1);
+        assert_eq!(loaded.users[0].tunnel_limit, 8);
         assert_eq!(loaded.users[0].tunnels[0].backend_port, 20_000);
         assert!(verify_password(&loaded.users[0].password_hash, "secret"));
         assert_eq!(
@@ -1136,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_existing_users_table_to_schema_v2() {
+    fn upgrades_existing_users_table_to_schema_v3() {
         let storage = temp_storage();
         let mut connection = Connection::open(storage.path()).unwrap();
         connection
@@ -1160,6 +1195,7 @@ mod tests {
             .unwrap();
         create_schema(&mut connection).unwrap();
         assert!(users_has_password_encrypted_column(&connection).unwrap());
+        assert!(users_has_column(&connection, "tunnel_limit").unwrap());
         let encrypted: String = connection
             .query_row(
                 "SELECT password_encrypted FROM users WHERE id = 'legacy-id'",
@@ -1168,6 +1204,14 @@ mod tests {
             )
             .unwrap();
         assert!(encrypted.is_empty());
+        let tunnel_limit: i64 = connection
+            .query_row(
+                "SELECT tunnel_limit FROM users WHERE id = 'legacy-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tunnel_limit, i64::from(DEFAULT_TUNNEL_LIMIT));
         let schema_version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
@@ -1205,6 +1249,7 @@ mod tests {
                 password_encrypted: String::new(),
                 secret: user_secret,
                 tunnels: Vec::new(),
+                tunnel_limit: DEFAULT_TUNNEL_LIMIT,
                 traffic_limit_bytes: 0,
                 traffic_used_bytes: 0,
                 speed_limit_mbps: 0,
