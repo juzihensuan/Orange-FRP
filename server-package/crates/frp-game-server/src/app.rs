@@ -171,7 +171,6 @@ enum Commands {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ServerUpdateManifest {
     version: String,
     installer_sha256: String,
@@ -607,6 +606,26 @@ fn parse_server_update_manifest(bytes: &[u8]) -> Result<(Version, String)> {
     Ok((version, installer_sha256))
 }
 
+fn parse_server_version_output(output: &[u8]) -> Result<Version> {
+    let text = String::from_utf8_lossy(output);
+    text.split_whitespace()
+        .find_map(|part| Version::parse(part.trim_start_matches(['v', 'V'])).ok())
+        .context("无法从服务端版本输出中读取版本号")
+}
+
+fn installed_server_version() -> Result<Version> {
+    let output = std::process::Command::new(SERVER_INSTALL_PATH)
+        .arg("--version")
+        .output()
+        .context("无法读取更新后的服务端版本")?;
+    if !output.status.success() {
+        bail!("更新后的服务端无法输出版本号。");
+    }
+    let mut version_output = output.stdout;
+    version_output.extend_from_slice(&output.stderr);
+    parse_server_version_output(&version_output)
+}
+
 fn write_update_installer(bytes: &[u8]) -> Result<PathBuf> {
     if !bytes.starts_with(b"#!/usr/bin/env bash") {
         bail!("下载的更新安装脚本格式不正确。");
@@ -697,6 +716,10 @@ fn command_check_update(yes: bool) -> Result<bool> {
         bail!("服务端更新安装脚本 SHA-256 校验失败，已拒绝执行。");
     }
     run_server_update_installer(&installer_bytes)?;
+    let installed = installed_server_version()?;
+    if installed != latest {
+        bail!("更新安装完成，但实际服务端版本为 v{installed}，预期为 v{latest}。");
+    }
     println!(
         "{}",
         color(
@@ -2655,7 +2678,7 @@ mod tests {
     #[test]
     fn parses_server_update_manifest_and_normalizes_digest() {
         let (version, digest) = parse_server_update_manifest(
-            br#"{"version":"v2.1.0","installer_sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+            br#"{"version":"v2.1.0","installer_sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","notes":"future-compatible"}"#,
         )
         .unwrap();
         assert_eq!(version, Version::new(2, 1, 0));
@@ -2669,5 +2692,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("SHA-256"));
+    }
+
+    #[test]
+    fn parses_server_binary_version_output() {
+        let version = parse_server_version_output(b"frp-game-server 2.1.0\n").unwrap();
+        assert_eq!(version, Version::new(2, 1, 0));
     }
 }
