@@ -13,12 +13,14 @@ use frp_game_common::{
 };
 use rand::seq::SliceRandom;
 use rand::{distributions::Alphanumeric, rngs::OsRng, Rng, RngCore};
+use semver::Version;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -38,6 +40,11 @@ use crate::storage::{
 };
 
 const SERVICE_NAME: &str = "frp-game";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SERVER_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/juzihensuan/Orange-FRP/main/server-package/update.json";
+const SERVER_UPDATE_INSTALLER_URL: &str =
+    "https://raw.githubusercontent.com/juzihensuan/Orange-FRP/main/install-server.sh";
 const DEFAULT_API_BIND: &str = "0.0.0.0";
 const ORANGE_FRPS_VERSION: &str = "0.69.1";
 const ORANGE_FRPS_DOWNLOAD_URL: &str = "https://raw.githubusercontent.com/juzihensuan/Orange-FRP/2fce759440a07f2b98a233faac947b82e6f40de4/Update/frps0.69.1";
@@ -54,9 +61,15 @@ const REPLAY_TTL: Duration = Duration::from_secs(300);
 const RATE_LIMIT_IDLE_TTL: Duration = Duration::from_secs(300);
 const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const DEFAULT_NEW_USER_TUNNEL_LIMIT: u32 = 5;
+const UPDATE_MANIFEST_MAX_BYTES: usize = 4 * 1024;
+const UPDATE_INSTALLER_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Parser)]
-#[command(name = "frp-game-server", about = "Orange FRP Linux 服务端管理工具")]
+#[command(
+    name = "frp-game-server",
+    version,
+    about = "Orange FRP Linux 服务端管理工具"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -132,6 +145,10 @@ enum Commands {
         #[arg(long)]
         limit: Option<u32>,
     },
+    CheckUpdate {
+        #[arg(short, long)]
+        yes: bool,
+    },
     Serve {
         #[arg(long)]
         api_only: bool,
@@ -151,6 +168,13 @@ enum Commands {
         #[arg(short, long)]
         yes: bool,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerUpdateManifest {
+    version: String,
+    installer_sha256: String,
 }
 
 #[derive(Clone)]
@@ -391,22 +415,15 @@ fn print_title() {
         "{}",
         color("======================================", "95;1")
     );
-    println!("{}", color("          Orange FRP服务端", "95;1"));
+    println!("{}", color("          Orange FRP 菜单栏", "95;1"));
+    println!(
+        "{}",
+        color(format!("          服务端版本 v{SERVER_VERSION}"), "90;1")
+    );
     println!(
         "{}",
         color("======================================", "95;1")
     );
-}
-
-fn print_root_warning() {
-    println!(
-        "{}",
-        color(
-            "高权限操作警告：安装、用户管理和卸载需要 root 权限。",
-            "33;1"
-        )
-    );
-    println!("{}", color("请确认你正在自己的 Linux 服务器上操作。", "33"));
 }
 
 fn prompt_non_empty(label: &str) -> Result<String> {
@@ -534,6 +551,162 @@ fn detect_public_ip() -> String {
     }
 }
 
+fn update_http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent(format!("orange-frp-server/{SERVER_VERSION}"))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .context("无法创建服务端更新客户端")
+}
+
+fn fetch_update_bytes(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let cache_busted_url = format!("{url}?t={}", now_unix());
+    let response = client
+        .get(cache_busted_url)
+        .header("Cache-Control", "no-cache")
+        .send()
+        .with_context(|| format!("无法下载{label}"))?
+        .error_for_status()
+        .with_context(|| format!("下载{label}失败"))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum_bytes as u64)
+    {
+        bail!("{label}超过允许大小，已拒绝处理。");
+    }
+    let mut bytes = Vec::with_capacity(maximum_bytes.min(16 * 1024));
+    response
+        .take(maximum_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("读取{label}失败"))?;
+    if bytes.len() > maximum_bytes {
+        bail!("{label}超过允许大小，已拒绝处理。");
+    }
+    Ok(bytes)
+}
+
+fn parse_server_update_manifest(bytes: &[u8]) -> Result<(Version, String)> {
+    let manifest: ServerUpdateManifest =
+        serde_json::from_slice(bytes).context("服务端更新清单格式不正确")?;
+    let version_text = manifest.version.trim().trim_start_matches(['v', 'V']);
+    let version = Version::parse(version_text).context("服务端更新版本号格式不正确")?;
+    let installer_sha256 = manifest.installer_sha256.trim().to_ascii_lowercase();
+    if installer_sha256.len() != 64
+        || !installer_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("服务端更新清单中的安装脚本 SHA-256 不正确。");
+    }
+    Ok((version, installer_sha256))
+}
+
+fn write_update_installer(bytes: &[u8]) -> Result<PathBuf> {
+    if !bytes.starts_with(b"#!/usr/bin/env bash") {
+        bail!("下载的更新安装脚本格式不正确。");
+    }
+    for _ in 0..8 {
+        let path = env::temp_dir().join(format!("orange-frp-update-{}.sh", random_token(24)));
+        let mut file = match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("无法创建服务端更新临时文件"),
+        };
+        let result = (|| -> Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&path);
+            return Err(error).context("写入服务端更新安装脚本失败");
+        }
+        return Ok(path);
+    }
+    bail!("无法分配服务端更新临时文件。");
+}
+
+fn run_server_update_installer(bytes: &[u8]) -> Result<()> {
+    let installer = write_update_installer(bytes)?;
+    let result = std::process::Command::new("bash")
+        .arg(&installer)
+        .status()
+        .context("无法执行服务端更新安装脚本");
+    let _ = fs::remove_file(&installer);
+    let status = result?;
+    if !status.success() {
+        bail!("服务端更新安装失败，退出状态：{status}");
+    }
+    Ok(())
+}
+
+fn command_check_update(yes: bool) -> Result<bool> {
+    let current = Version::parse(SERVER_VERSION).context("当前服务端版本号格式不正确")?;
+    println!("当前服务端版本: v{current}");
+    println!("正在检查服务端更新...");
+    let client = update_http_client()?;
+    let manifest_bytes = fetch_update_bytes(
+        &client,
+        SERVER_UPDATE_MANIFEST_URL,
+        UPDATE_MANIFEST_MAX_BYTES,
+        "服务端更新清单",
+    )?;
+    let (latest, expected_installer_sha256) = parse_server_update_manifest(&manifest_bytes)?;
+    println!("更新通道版本: v{latest}");
+    if latest == current {
+        println!("{}", color("当前已是最新版本。", "32;1"));
+        return Ok(false);
+    }
+    if latest < current {
+        println!("{}", color("当前版本高于公开更新通道，无需更新。", "36;1"));
+        return Ok(false);
+    }
+    println!(
+        "{}",
+        color(format!("发现服务端新版本：v{current} -> v{latest}"), "33;1")
+    );
+    if !yes && prompt_non_empty("是否立即更新？输入 YES 确认: ")? != "YES" {
+        println!("已取消服务端更新。");
+        return Ok(false);
+    }
+    require_root("更新服务端")?;
+    println!("正在下载安装脚本...");
+    let installer_bytes = fetch_update_bytes(
+        &client,
+        SERVER_UPDATE_INSTALLER_URL,
+        UPDATE_INSTALLER_MAX_BYTES,
+        "服务端更新安装脚本",
+    )?;
+    let installer_sha256 = sha256_hex(&installer_bytes);
+    if !installer_sha256.eq_ignore_ascii_case(&expected_installer_sha256) {
+        bail!("服务端更新安装脚本 SHA-256 校验失败，已拒绝执行。");
+    }
+    run_server_update_installer(&installer_bytes)?;
+    println!(
+        "{}",
+        color(
+            format!("服务端已更新到 v{latest}，请重新输入 orange 打开菜单栏。"),
+            "32;1"
+        )
+    );
+    Ok(true)
+}
+
 fn command_init(
     api_bind: String,
     api_port: u16,
@@ -602,6 +775,7 @@ fn command_setup(
 
 fn command_show() -> Result<()> {
     let config = storage().read()?;
+    println!("服务端版本: v{SERVER_VERSION}");
     println!("服务器公网IP: {}", detect_public_ip());
     println!("认证端口: {}", config.api_port);
     println!("FRP控制端口: {}", config.frps_bind_port);
@@ -1159,7 +1333,6 @@ fn command_menu() -> Result<()> {
     loop {
         print!("\x1b[2J\x1b[H");
         print_title();
-        print_root_warning();
         println!();
         println!("1. 添加用户");
         println!("2. 查看用户");
@@ -1169,7 +1342,8 @@ fn command_menu() -> Result<()> {
         println!("6. 修改用户已用流量");
         println!("7. 修改用户速度限制");
         println!("8. 修改用户隧道数量限制");
-        println!("9. 卸载服务端");
+        println!("9. 检查服务端更新");
+        println!("10. 卸载服务端");
         println!("0. 退出菜单");
         println!();
         let choice = prompt_non_empty("请选择操作: ")?;
@@ -1182,7 +1356,12 @@ fn command_menu() -> Result<()> {
             "6" => command_set_traffic_used(None, None),
             "7" => command_set_speed_limit(None, None),
             "8" => command_set_tunnel_limit(None, None),
-            "9" => {
+            "9" => match command_check_update(false) {
+                Ok(true) => return Ok(()),
+                Ok(false) => Ok(()),
+                Err(error) => Err(error),
+            },
+            "10" => {
                 let confirm =
                     prompt_non_empty("将停止服务并完全卸载 Orange FRP 服务端，输入 YES 确认: ")?;
                 if confirm == "YES" {
@@ -1482,6 +1661,7 @@ async fn hello(
     Json(json!({
         "ok": true,
         "version": 1,
+        "server_version": SERVER_VERSION,
         "salt": api_salt,
         "api_port": api_port,
         "frps_port": frps_bind_port,
@@ -2212,10 +2392,11 @@ fn command_uninstall(yes: bool) -> Result<()> {
 }
 
 pub async fn run() -> Result<()> {
+    let command = Cli::parse().command;
     if !cfg!(target_os = "linux") {
         bail!("Orange FRP 服务端仅支持 Linux。");
     }
-    match Cli::parse().command {
+    match command {
         Commands::Init {
             api_bind,
             api_port,
@@ -2259,6 +2440,7 @@ pub async fn run() -> Result<()> {
         Commands::SetTrafficUsed { account, gb } => command_set_traffic_used(account, gb),
         Commands::SetSpeedLimit { account, mbps } => command_set_speed_limit(account, mbps),
         Commands::SetTunnelLimit { account, limit } => command_set_tunnel_limit(account, limit),
+        Commands::CheckUpdate { yes } => command_check_update(yes).map(|_| ()),
         Commands::Serve { api_only } => command_serve(api_only).await,
         Commands::InstallService => command_install_service(),
         Commands::InstallFrps { force } => {
@@ -2468,5 +2650,24 @@ mod tests {
         let remaining = vec![second];
         let normalized = normalize_user_tunnels(&config, 0, &remaining).unwrap();
         assert_eq!(normalized.len(), 1);
+    }
+
+    #[test]
+    fn parses_server_update_manifest_and_normalizes_digest() {
+        let (version, digest) = parse_server_update_manifest(
+            br#"{"version":"v2.1.0","installer_sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        )
+        .unwrap();
+        assert_eq!(version, Version::new(2, 1, 0));
+        assert_eq!(digest, "a".repeat(64));
+    }
+
+    #[test]
+    fn rejects_invalid_update_installer_digest() {
+        let error = parse_server_update_manifest(
+            br#"{"version":"2.1.0","installer_sha256":"not-a-digest"}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("SHA-256"));
     }
 }

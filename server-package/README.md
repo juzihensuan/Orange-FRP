@@ -38,7 +38,17 @@ sudo bash install.sh --install
 orange
 ```
 
-菜单支持用户增删查、端口与上下行流量查看、总流量和剩余流量查看、流量限制、已用流量、Mbps 限速和隧道数量限制修改，以及完整卸载。
+当前服务端版本为 `2.1.0`。菜单标题显示为 `Orange FRP 菜单栏`，支持用户增删查、端口与上下行流量查看、总流量和剩余流量查看、流量限制、已用流量、Mbps 限速、隧道数量限制修改、手动检查更新和完整卸载。
+
+查看版本或直接检查更新：
+
+```bash
+frp-game-server --version
+sudo frp-game-server check-update
+sudo frp-game-server check-update --yes
+```
+
+更新程序从 GitHub `main` 分支读取 `server-package/update.json`，并在执行一键安装脚本前验证下载大小和 SHA-256。重复安装会保留 `/etc/frp-game/orange-frp.db`。
 
 服务端使用 `/etc/frp-game/orange-frp.db` 保存 SQLite 数据。旧版 `config.json` 会自动迁移并保留带时间戳的备份，明文密码会转换为 Argon2id 摘要。
 
