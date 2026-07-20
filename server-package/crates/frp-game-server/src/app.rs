@@ -767,7 +767,7 @@ fn command_setup(
 
     let storage = storage();
     storage.initialize()?;
-    let mut config = if storage.is_initialized()? {
+    let config = if storage.is_initialized()? {
         let mut config = storage.read()?;
         config.api_bind = api_bind;
         config.api_port = api_port;
@@ -785,7 +785,6 @@ fn command_setup(
     };
     write_frps_config(&config)?;
     command_install_service()?;
-    config = storage.read()?;
     println!("SQLite 数据库：{}", storage.path().display());
     println!("当前用户数量：{}", config.users.len());
     println!();
