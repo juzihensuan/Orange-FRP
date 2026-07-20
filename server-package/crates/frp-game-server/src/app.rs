@@ -2678,17 +2678,17 @@ mod tests {
     #[test]
     fn parses_server_update_manifest_and_normalizes_digest() {
         let (version, digest) = parse_server_update_manifest(
-            br#"{"version":"v2.1.0","installer_sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","notes":"future-compatible"}"#,
+            br#"{"version":"v1.1.4","installer_sha256":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","notes":"future-compatible"}"#,
         )
         .unwrap();
-        assert_eq!(version, Version::new(2, 1, 0));
+        assert_eq!(version, Version::new(1, 1, 4));
         assert_eq!(digest, "a".repeat(64));
     }
 
     #[test]
     fn rejects_invalid_update_installer_digest() {
         let error = parse_server_update_manifest(
-            br#"{"version":"2.1.0","installer_sha256":"not-a-digest"}"#,
+            br#"{"version":"1.1.4","installer_sha256":"not-a-digest"}"#,
         )
         .unwrap_err();
         assert!(error.to_string().contains("SHA-256"));
@@ -2696,7 +2696,7 @@ mod tests {
 
     #[test]
     fn parses_server_binary_version_output() {
-        let version = parse_server_version_output(b"frp-game-server 2.1.0\n").unwrap();
-        assert_eq!(version, Version::new(2, 1, 0));
+        let version = parse_server_version_output(b"frp-game-server 1.1.4\n").unwrap();
+        assert_eq!(version, Version::new(1, 1, 4));
     }
 }

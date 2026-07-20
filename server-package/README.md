@@ -1,6 +1,6 @@
 # Orange FRP Linux 服务端包
 
-此目录可以独立上传到 Linux，只包含安装脚本、服务端和共享协议源码，不包含 Windows 客户端。
+此目录可以独立上传到 Linux，只包含安装脚本、服务端和共享协议源码，不包含 Windows 客户端。默认安装直接下载经过 SHA-256 校验的静态服务端，不需要 Rust 或系统编译工具链。
 
 ```text
 server-package/
@@ -30,7 +30,15 @@ sudo bash install.sh
 sudo bash install.sh --install
 ```
 
-脚本会安装系统依赖和 Rust、执行 `cargo build --release --locked`、校验并安装 FRPS 0.69.1、创建 `frp-game.service` 并设置开机自启。重复安装会停止旧服务、替换程序并重新启动，不会继续运行旧二进制。
+默认脚本只需要 `curl`、`sha256sum`、`coreutils` 和 systemd。它会下载约 6.6 MiB 的 Linux x86_64 静态服务端，验证固定 SHA-256 和版本号，再校验并安装 FRPS 0.69.1、创建 `frp-game.service` 并设置开机自启。重复安装会复用版本正确的 FRPS，不会重新下载 Rust 或编译依赖。
+
+只有开发或无法使用预编译程序时才从源码构建：
+
+```bash
+sudo bash install.sh --build-from-source
+```
+
+该模式才会安装 Rust、GCC、Make 和 pkg-config，并执行锁定依赖的 Release 构建。
 
 安装完成后运行：
 
@@ -38,7 +46,9 @@ sudo bash install.sh --install
 orange
 ```
 
-当前服务端版本为 `2.1.0`。菜单标题显示为 `Orange FRP 菜单栏`，支持用户增删查、端口与上下行流量查看、总流量和剩余流量查看、流量限制、已用流量、Mbps 限速、隧道数量限制修改、手动检查更新和完整卸载。
+当前服务端版本为 `1.1.4`，与客户端版本同步。菜单标题显示为 `Orange FRP 菜单栏`，支持用户增删查、端口与上下行流量查看、总流量和剩余流量查看、流量限制、已用流量、Mbps 限速、隧道数量限制修改、手动检查更新和完整卸载。
+
+从旧服务端 `2.1.0` 切换到 `1.1.4` 时需手动执行一次一键安装命令。旧版更新器会把 `1.1.4` 判断为较低版本；手动安装只替换程序和服务配置，不会删除 SQLite 用户、隧道或流量数据。
 
 查看版本或直接检查更新：
 
@@ -48,7 +58,7 @@ sudo frp-game-server check-update
 sudo frp-game-server check-update --yes
 ```
 
-更新程序从 GitHub `main` 分支读取 `server-package/update.json`，并在执行一键安装脚本前验证下载大小和 SHA-256。重复安装会保留 `/etc/frp-game/orange-frp.db`。
+更新程序从 GitHub `main` 分支读取 `server-package/update.json`，并在执行一键安装脚本前验证下载大小和 SHA-256。安装器还会再次验证二级安装脚本和静态服务端二进制；重复安装会保留 `/etc/frp-game/orange-frp.db`。
 
 服务端使用 `/etc/frp-game/orange-frp.db` 保存 SQLite 数据。旧版 `config.json` 会自动迁移并保留带时间戳的备份，明文密码会转换为 Argon2id 摘要。
 

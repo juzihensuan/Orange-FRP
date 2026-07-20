@@ -3,7 +3,9 @@ set -euo pipefail
 
 REPOSITORY="juzihensuan/Orange-FRP"
 BRANCH="main"
-ARCHIVE_URL="https://github.com/${REPOSITORY}/archive/refs/heads/${BRANCH}.tar.gz"
+PACKAGE_INSTALLER_URL="${ORANGE_FRP_PACKAGE_INSTALLER_URL:-https://raw.githubusercontent.com/${REPOSITORY}/${BRANCH}/server-package/install.sh}"
+PACKAGE_INSTALLER_SHA256="${ORANGE_FRP_PACKAGE_INSTALLER_SHA256:-d42dbadd1335253b14ae898a410ef143013419c476171540eae6881c95c46361}"
+MAX_INSTALLER_BYTES=$((128 * 1024))
 
 RED="\033[31;1m"
 GREEN="\033[32;1m"
@@ -15,39 +17,25 @@ fail() {
   exit 1
 }
 
-install_archive_tools() {
-  if command -v tar >/dev/null 2>&1 && command -v gzip >/dev/null 2>&1; then
+sha256_file() {
+  local output
+  if command -v sha256sum >/dev/null 2>&1; then
+    output="$(sha256sum "$1")"
+    printf '%s\n' "${output%% *}"
     return
   fi
-
-  echo -e "${CYAN}正在安装源码解压工具...${RESET}"
-  if command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y tar gzip
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y tar gzip
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y tar gzip
-  elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm tar gzip
-  elif command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive install tar gzip
-  else
-    fail "缺少 tar/gzip，且未识别可用的包管理器。"
+  if command -v shasum >/dev/null 2>&1; then
+    output="$(shasum -a 256 "$1")"
+    printf '%s\n' "${output%% *}"
+    return
   fi
+  fail "缺少 SHA-256 校验工具。"
 }
 
-if [ "$(uname -s)" != "Linux" ]; then
-  fail "Orange FRP 服务端仅支持 Linux。"
-fi
+[ "$(uname -s)" = "Linux" ] || fail "Orange FRP 服务端仅支持 Linux。"
+[ "$(id -u)" -eq 0 ] || fail "请使用 root 权限运行，例如：curl -fsSL https://raw.githubusercontent.com/${REPOSITORY}/${BRANCH}/install-server.sh | sudo bash"
 
-if [ "$(id -u)" -ne 0 ]; then
-  fail "请使用 root 权限运行，例如：curl -fsSL https://raw.githubusercontent.com/${REPOSITORY}/${BRANCH}/install-server.sh | sudo bash"
-fi
-
-install_archive_tools
-
-for command in curl tar gzip find mktemp; do
+for command in curl bash mktemp wc; do
   command -v "${command}" >/dev/null 2>&1 || fail "缺少必要命令：${command}"
 done
 
@@ -57,17 +45,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-archive="${temporary_dir}/orange-frp.tar.gz"
-echo -e "${CYAN}正在从 GitHub 下载 Orange FRP 服务端源码...${RESET}"
+installer="${temporary_dir}/install.sh"
+echo -e "${CYAN}正在下载 Orange FRP 轻量安装器...${RESET}"
 curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
-  "${ARCHIVE_URL}" -o "${archive}"
-tar -xzf "${archive}" -C "${temporary_dir}"
+  "${PACKAGE_INSTALLER_URL}" -o "${installer}"
 
-installer="$(find "${temporary_dir}" -type f -path '*/server-package/install.sh' -print -quit)"
-[ -n "${installer}" ] || fail "下载内容中未找到 server-package/install.sh。"
+installer_size="$(wc -c < "${installer}")"
+[ "${installer_size}" -gt 0 ] || fail "下载的安装器为空。"
+[ "${installer_size}" -le "${MAX_INSTALLER_BYTES}" ] || fail "下载的安装器超过大小限制。"
+[ "$(sha256_file "${installer}")" = "${PACKAGE_INSTALLER_SHA256}" ] \
+  || fail "安装器 SHA-256 校验失败，已拒绝执行。"
+head -n 1 "${installer}" | grep -q '^#!/usr/bin/env bash$' \
+  || fail "下载的安装器格式不正确。"
 
-bundle_dir="$(dirname -- "${installer}")"
-echo -e "${CYAN}源码下载完成，开始编译并安装...${RESET}"
-ORANGE_FRP_ROOT="${bundle_dir}" bash "${installer}" --install
+echo -e "${CYAN}校验通过，开始安装预编译服务端...${RESET}"
+bash "${installer}" --install
 
 echo -e "${GREEN}Orange FRP 服务端一键安装完成。输入 orange 即可打开管理菜单。${RESET}"
